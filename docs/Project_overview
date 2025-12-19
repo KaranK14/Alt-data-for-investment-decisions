@@ -1,0 +1,685 @@
+# Clinical Trial Feasibility Prediction - Machine Learning Pipeline
+
+## Project Overview
+
+This project implements a comprehensive machine learning pipeline to predict clinical trial completion/non-completion (feasibility) using publicly available ClinicalTrials.gov (CTGov) data. The pipeline follows a methodology aligned with published research, incorporating both structured (tabular) and unstructured (textual) data through domain-specific embeddings and advanced feature engineering techniques.
+
+**Key Innovation**: Integration of BioLinkBERT embeddings (domain-specific biomedical language model) with traditional tabular features to capture semantic information from trial descriptions, eligibility criteria, and other textual fields that may not be explicitly captured in structured variables.
+
+---
+
+## Table of Contents
+
+1. [Project Summary](#project-summary)
+2. [Dataset Overview](#dataset-overview)
+3. [Data Pipeline](#data-pipeline)
+4. [Feature Engineering](#feature-engineering)
+5. [Model Architecture](#model-architecture)
+6. [Experiments and Results](#experiments-and-results)
+7. [Technical Implementation](#technical-implementation)
+8. [Key Contributions](#key-contributions)
+
+---
+
+## Project Summary
+
+### Objective
+Predict whether a clinical trial will complete successfully or be terminated/withdrawn before completion, using information available at trial registration.
+
+### Problem Significance
+- **High failure rate**: Approximately 40-50% of clinical trials fail to complete, leading to wasted resources
+- **Early prediction value**: Identifying trials at risk of failure early can help stakeholders make informed decisions about resource allocation and protocol design
+- **Real-world impact**: Improved trial feasibility prediction can reduce costs and accelerate drug development
+
+### Approach
+- **Multi-modal learning**: Combine structured tabular data with unstructured textual embeddings
+- **Comprehensive feature engineering**: Extract domain-specific features (disease flags, intervention types, eligibility complexity)
+- **Advanced ML models**: Evaluate multiple model families (SVM, Random Forest, XGBoost, Neural Networks)
+- **Rigorous evaluation**: 10-iteration repeated runs with multiple class imbalance strategies
+
+---
+
+## Dataset Overview
+
+### Data Source
+- **Primary Source**: ClinicalTrials.gov v2 API
+- **Data Type**: Publicly available clinical trial protocol information
+- **Format**: JSON/JSONL files containing comprehensive trial metadata
+
+### Filtering Criteria
+To ensure a homogeneous, high-quality dataset, we applied the following filters:
+
+1. **Trial Phase**: Phase 2, Phase 3, or Phase 4 (including Phase 2/3 combination trials)
+   - **Rationale**: These phases represent critical decision points where feasibility prediction is most valuable
+
+2. **Study Type**: Interventional studies only
+   - **Rationale**: Excludes observational studies which have different feasibility characteristics
+
+3. **Sponsor Type**: Industry-sponsored (company-sponsored) trials only
+   - **Rationale**: Industry-sponsored trials have more standardized reporting and resource allocation, enabling better generalization
+
+4. **Disease Domain**: All oncology/cancer indications
+   - **Rationale**: Maintains domain homogeneity while providing sufficient sample size (~7,400+ final-status trials)
+
+5. **Trial Status**: Only final-status trials included
+   - **Included**: COMPLETED, TERMINATED, WITHDRAWN, SUSPENDED
+   - **Excluded**: All ongoing trials (RECRUITING, ACTIVE_NOT_RECRUITING, ENROLLING_BY_INVITATION, etc.)
+   - **Rationale**: Ongoing trials have unknown final outcomes and are inappropriate for training a feasibility prediction model
+
+### Final Dataset Statistics
+
+- **Total Trials**: **7,444 trials** (after filtering, label assignment, and excluding ongoing trials)
+- **Completed Trials**: **5,639 (75.8%)**
+- **Non-Completed Trials**: **1,805 (24.2%)**
+- **Class Distribution**: Moderate imbalance favoring completed trials (ratio: 1:3.12)
+- **Excluded**: **2,964 ongoing/unknown status trials** (RECRUITING, ACTIVE_NOT_RECRUITING, ENROLLING_BY_INVITATION, etc.) - excluded because their final outcome is unknown
+
+### Phase Distribution
+- **Phase 2**: 4,576 trials (61.5%)
+- **Phase 3**: 2,424 trials (32.6%)
+- **Phase 4**: 444 trials (6.0%)
+
+### Variables Extracted
+
+From each trial's JSON protocol, we extracted **108 total variables** from all available CTGov modules:
+
+**Core Modules Extracted:**
+- **Identification Module**: NCT ID, titles, acronyms, secondary IDs
+- **Status Module**: Overall status, dates (start, completion, submission, posting), why_stopped
+- **Design Module**: Phase, study type, allocation, masking, intervention model, enrollment info, target duration
+- **Arms/Interventions Module**: Arm groups, intervention names, types, descriptions
+- **Conditions Module**: Conditions, keywords, MeSH terms
+- **Outcomes Module**: Primary, secondary, and other outcome measures
+- **Eligibility Module**: Eligibility criteria text, age ranges, sex/gender, healthy volunteers, study population
+- **Sponsor/Collaborators Module**: Lead sponsor, collaborators, responsible party information
+- **Contacts/Locations Module**: Facility locations (countries, cities, states), officials, contacts
+- **Description Module**: Brief summary, detailed description
+- **Oversight Module**: Data Monitoring Committee (DMC) status, FDA regulation flags
+- **IPD Sharing Module**: Individual Participant Data sharing statements
+
+**Feature Categorization:**
+- **55 Tabular Features**: Structured features used for model training
+- **8 Text Columns**: Used for embedding generation (excluded from direct tabular features)
+- **26 JSON Columns**: Structured data encoded as JSON (excluded to avoid dimensionality issues)
+- **17 Leakage Columns**: Post-hoc information excluded to prevent data leakage (dates, status, actual enrollment)
+
+---
+
+## Data Pipeline
+
+The complete pipeline consists of 7 sequential steps:
+
+### Step 1: Parse Raw Data (`01_parse_raw_data.py`)
+- **Input**: Raw JSONL files from CTGov v2 API download
+- **Process**: 
+  - Filter trials based on phase, study type, sponsor type, disease domain
+  - Extract all variables from protocol sections
+  - Derive binary label: `label_feasible` (1 = COMPLETED, 0 = TERMINATED/WITHDRAWN/SUSPENDED/OTHER)
+- **Output**: `data/01_parsed_trials.parquet` (108 columns)
+
+**Key Extractions:**
+- Design features: phase, allocation, masking, number of arms, intervention model
+- Eligibility: age ranges, gender, healthy volunteers, eligibility criteria text
+- Enrollment: planned enrollment count and type
+- Sponsor/Location: sponsor information, facility counts, geographic flags
+- Regulatory: DMC status, FDA regulation flags
+- Dates: Start date (for feature engineering), exclusion of post-hoc dates
+
+### Step 2: Extract MeSH/Disease and Intervention Features (`02_extract_mesh_features.py`)
+- **Input**: Parsed trials from Step 1
+- **Process**:
+  - Extract disease-specific flags from condition text using keyword matching
+  - Extract intervention type flags from intervention text
+  - Create binary indicators for various cancer types and therapy modalities
+- **Output**: `data_enhanced/02_trials_with_mesh.parquet`
+
+**Features Created:**
+- **~25 Disease Flags**: NSCLC, SCLC, breast, prostate, colorectal, gastric, pancreatic, hepatocellular, renal, bladder, ovarian, cervical, endometrial, esophageal, head/neck, brain, thyroid, sarcoma, lymphoma, myeloma, leukemia types, plus `is_other_cancer` and `is_other`
+- **~10 Intervention Flags**: Immunotherapy, TKI (tyrosine kinase inhibitors), ADC (antibody-drug conjugates), chemotherapy, targeted therapy, surgery, radiotherapy, cell therapy, hormone therapy
+
+**Method**: Case-insensitive keyword matching on condition and intervention text fields.
+
+### Step 3: Extract Eligibility Complexity Features (`03_extract_eligibility_complexity.py`)
+- **Input**: Trials with MeSH features from Step 2
+- **Process**:
+  - Calculate complexity metrics from eligibility criteria text
+  - Extract structural features (length, word count, bullet points, line breaks)
+  - Count inclusion/exclusion criteria items
+  - Extract medical term frequencies
+- **Output**: `data_enhanced/03_trials_with_eligibility.parquet`
+
+**Features Created (6 complexity metrics):**
+- Text length: `eligibility_text_len`
+- Structural: `num_inclusion_criteria`, `num_exclusion_criteria`
+- Section-specific: `inclusion_text_len`, `exclusion_text_len`, `num_inclusion_items`, `num_exclusion_items`
+
+**Rationale**: More complex eligibility criteria may indicate:
+- More selective patient populations (potentially easier to complete due to better patient fit)
+- More sophisticated trial design (potentially better planning and execution)
+- Higher safety standards (may correlate with sponsor investment level)
+
+### Step 4: Generate Text Embeddings (`04_generate_embeddings.py`)
+- **Input**: Trials with eligibility features from Step 3
+- **Process**:
+  - Combine text fields: `brief_title`, `official_title`, `brief_summary`, `detailed_description`, `eligibility_criteria_text`
+  - Generate BioLinkBERT embeddings (768 dimensions per trial)
+  - Handle missing text by replacing with empty strings
+- **Output**: `data_enhanced/04_trials_with_embeddings.parquet`
+
+**Embedding Model**: BioLinkBERT-base (`michiyasunaga/BioLinkBERT-base`)
+- **Architecture**: BERT-base (12 layers, 768 hidden dimensions, 12 attention heads)
+- **Pre-training**: PubMed abstracts, clinical trial descriptions, biomedical literature
+- **Why BioLinkBERT?**: Domain-specific pre-training captures biomedical terminology and clinical trial context better than general-purpose language models
+
+**Processing Details**:
+- Batch size: 32 (configurable)
+- Maximum sequence length: 512 tokens (BERT standard)
+- Embedding extraction: `[CLS]` token (captures overall sequence representation)
+- GPU acceleration: Recommended for faster processing
+
+### Step 5: Apply PCA Dimensionality Reduction (`05_apply_pca.py`)
+- **Input**: Trials with embeddings from Step 4
+- **Process**:
+  - Standardize embeddings (StandardScaler: mean=0, std=1)
+  - Fit PCA on training data only (prevent data leakage)
+  - Retain components explaining 95% of variance
+  - Transform train/val/test sets using fitted PCA
+  - Save PCA model and scaler for reproducibility
+- **Output**: `data_enhanced/05_trials_with_pca.parquet`, `results/models/pca_model.pkl`, `results/models/pca_scaler.pkl`
+
+**PCA Results**:
+- **Original dimension**: 768
+- **Reduced dimension**: ~295 components (retaining 95% variance)
+- **Compression ratio**: ~2.6x reduction (768 → 295)
+- **Variance explained**: 95.0% (by definition)
+- **Top 10 components**: Explain substantial variance (concentrated information)
+
+**Rationale for PCA**:
+- Reduces dimensionality to prevent overfitting
+- Removes multicollinearity among embedding dimensions
+- Speeds up model training and inference
+- Filters noise while preserving semantic information
+
+### Step 6: Combine All Features (`06_combine_features.py`)
+- **Input**: Trials with PCA embeddings from Step 5
+- **Process**:
+  - Merge all features: tabular (55) + disease flags (~25) + intervention flags (~10) + eligibility complexity (~20) + PCA embeddings (295)
+  - Drop original 768-dimension embeddings (keep only PCA-reduced)
+  - Ensure label exists, drop trials with missing labels
+  - Final data quality checks
+- **Output**: `data_enhanced/oncology_phase23_enhanced_hist.parquet` (final dataset for modeling)
+
+**Final Feature Count**: ~460 total columns
+- Tabular features: ~112 (55 base + disease/intervention flags + complexity)
+- PCA embeddings: 295
+- Metadata: IDs, labels, text columns (excluded from model training)
+
+### Step 7: Train and Evaluate Models (`07_train_models.py`)
+- **Input**: Final combined dataset from Step 6
+- **Process**: (See Model Architecture section below)
+- **Output**: `results/model_comparison.csv`, `results/model_comparison.md`
+
+---
+
+## Feature Engineering
+
+### Feature Categories
+
+#### 1. Tabular Features (55 base features)
+
+**Design Features (11):**
+- `phase`: Trial phase (PHASE2, PHASE3, PHASE4, PHASE2|PHASE3)
+- `study_type`: Study type (INTERVENTIONAL)
+- `allocation`: Randomization method
+- `intervention_model`: Intervention model (Parallel, Crossover, etc.)
+- `intervention_model_description`: Detailed intervention model description
+- `primary_purpose`: Primary purpose (Treatment, Prevention, etc.)
+- `masking`: Blinding information (Open Label, Single/Double Blind)
+- `masking_description`: Detailed masking description
+- `who_masked`: Who is masked in the trial
+- `number_of_arms`: Number of treatment arms
+- `observational_model`, `patient_registry`, `time_perspective`: Additional design features
+
+**Eligibility Features (9):**
+- `min_age`, `max_age`: Age eligibility ranges
+- `sex`/`gender`: Sex/gender eligibility (ALL, MALE, FEMALE)
+- `gender_based`: Gender-based eligibility flag
+- `gender_description`: Gender eligibility description
+- `healthy_volunteers`: Healthy volunteers accepted (Yes/No)
+- `study_population`: Study population description
+- `sampling_method`: Sampling method
+- `patient_registry`: Patient registry flag
+
+**Enrollment Features (2):**
+- `enrollment_planned`: Planned enrollment count (target sample size)
+- `enrollment_planned_type`: Enrollment type (ANTICIPATED, ACTUAL)
+
+**Sponsor and Responsible Party Features (9):**
+- `lead_sponsor_name`: Lead sponsor name
+- `lead_sponsor_type`: Lead sponsor type (Industry, Other)
+- `responsible_party_type`, `responsible_party_name`, `responsible_party_organization`, `responsible_party_title`
+- `responsible_party_investigator_full_name`, `responsible_party_investigator_title`, `responsible_party_investigator_affiliation`
+
+**Location Features (5):**
+- `number_of_facilities`: Number of participating facilities/sites
+- `has_us_sites`: Binary flag for US sites
+- `has_china_sites`: Binary flag for China sites
+- `has_eu_sites`: Binary flag for EU sites
+- `is_multicountry`: Binary flag for multi-country trials
+
+**Regulatory and Oversight Features (6):**
+- `has_dmc`: Has Data Monitoring Committee
+- `is_fda_regulated_drug`: FDA-regulated drug flag
+- `is_fda_regulated_device`: FDA-regulated device flag
+- `is_unapproved_device`: Unapproved device flag
+- `is_ppsd`: PPSD flag
+- `is_us_export`: US export flag
+
+**Other Features (13):**
+- `acronym`: Trial acronym
+- `has_expanded_access`: Expanded access availability
+- `has_ipd_sharing_plan`: IPD sharing plan (Yes/No)
+- IPD sharing details: `ipd_sharing_description`, `ipd_sharing_access_criteria`, `ipd_sharing_time_frame`, `ipd_sharing_url`
+- Biospecimen info: `biospec_retention`, `biospec_description`
+- `target_duration`: Target trial duration
+- `start_date`: Trial start date (encoded as feature)
+
+#### 2. Disease-Specific Flags (~25 features)
+Binary indicators for specific cancer types extracted from condition text using keyword matching.
+
+#### 3. Intervention Type Flags (~10 features)
+Binary indicators for therapy modalities extracted from intervention text.
+
+#### 4. Eligibility Complexity Features (~20 features)
+Numeric metrics quantifying the complexity and stringency of eligibility criteria.
+
+#### 5. PCA-Reduced Embeddings (295 features)
+Semantic representations of textual trial information (descriptions, eligibility criteria) compressed from 768 to 295 dimensions.
+
+### Feature Exclusion Strategy
+
+To prevent data leakage and ensure realistic prediction, we explicitly excluded:
+
+**Leakage Columns (17):**
+- **Post-hoc dates**: `completion_date`, `primary_completion_date`, `first_posted_date`, `last_update_posted_date`, `last_update_submit_date`, `results_first_posted_date`, `results_first_submit_date`, `results_first_submit_qc_date`, `status_verified_date`, `study_first_submit_date`, `study_first_submit_qc_date`
+- **Post-hoc status**: `overall_status`, `last_known_status`, `why_stopped`, `has_results`
+- **Post-hoc enrollment**: `enrollment_actual`, `enrollment_actual_type`
+
+**Rationale**: This information is only available after trial completion and would create unrealistic prediction scenarios.
+
+**Text Columns (8):** Excluded from direct tabular features (used for embeddings instead):
+- `brief_title`, `official_title`, `brief_summary`, `detailed_description`, `eligibility_criteria_text`, `condition_text`, `intervention_text`, `description_text`
+
+**JSON Columns (26):** Excluded to avoid dimensionality issues:
+- Lists and dictionaries encoded as JSON strings (condition lists, intervention lists, outcomes, MeSH terms, references, locations, etc.)
+
+---
+
+## Model Architecture
+
+### Comparison Framework
+
+We evaluate models under two distinct settings to assess the added value of textual embeddings:
+
+1. **Tabular-Only Mode**: Models trained solely on structured (tabular) features
+2. **Tabular+Embeddings Mode**: Models trained on structured features + PCA-reduced textual embeddings
+
+This comparative setup allows us to evaluate whether trial descriptions, encoded as semantic embeddings, contain predictive signals beyond conventional structured variables.
+
+### Models Implemented
+
+#### 1. Support Vector Machine (SVM) - Baseline
+
+**Configuration:**
+- **Mode**: Tabular-only (serves as baseline)
+- **Kernel**: Linear
+- **Hyperparameters**: 
+  - `kernel='linear'`
+  - `probability=True` (for probability estimates)
+  - `class_weight='balanced'` (handles class imbalance)
+  - `random_state=42`
+- **Preprocessing**: 
+  - Missing value imputation (median for numeric, most frequent for categorical)
+  - StandardScaler normalization
+- **Hyperparameter Tuning**: None (serves as baseline)
+
+**Rationale**: Simple, interpretable baseline to assess whether more complex models offer improvements.
+
+#### 2. Random Forest
+
+**Configuration:**
+- **Modes**: Both tabular-only and tabular+embeddings
+- **Hyperparameter Tuning**: Grid search with 5-fold cross-validation
+  - `n_estimators`: [100, 200, 300]
+  - `max_depth`: [10, 20, None]
+  - `max_features`: ['sqrt', 'log2']
+  - `class_weight`: ['balanced'] (for class_weight strategy only)
+- **Preprocessing**: Handles mixed data types natively
+- **Imbalance Strategies**: 
+  - `class_weight='balanced'` (original data with adjusted weights)
+  - Fully downsampled (1:1 ratio, no class weights)
+  - Partially downsampled (1:1.5 ratio) with `class_weight='balanced'`
+  - Partially downsampled (1:2 ratio) with `class_weight='balanced'`
+
+**Rationale**: Strong performance on structured data, interpretable feature importances, handles non-linearity and feature interactions.
+
+#### 3. XGBoost (Extreme Gradient Boosting)
+
+**Configuration:**
+- **Modes**: Both tabular-only and tabular+embeddings
+- **Base Configuration**:
+  - `objective='binary:logistic'`
+  - `eval_metric='logloss'`
+  - `use_label_encoder=False`
+- **Hyperparameter Tuning**: Grid search with 5-fold cross-validation
+  - `n_estimators`: [100, 200, 300]
+  - `max_depth`: [3, 5, 7]
+  - `learning_rate`: [0.01, 0.05, 0.1]
+  - `subsample`: [0.8, 0.9]
+  - `colsample_bytree`: [0.8, 0.9]
+- **Preprocessing**: 
+  - Converts object dtype columns to numeric (LabelEncoder for categorical, direct conversion for numeric strings)
+  - Handles missing values (fillna with 0 or mode)
+- **Imbalance Strategies**: Same as Random Forest
+
+**Rationale**: State-of-the-art performance on structured data, gradient boosting with regularization, handles complex feature interactions.
+
+#### 4. Dual-Tower Neural Network
+
+**Architecture:**
+- **Mode**: Tabular+embeddings only (requires both feature types)
+- **Tabular Tower**: 
+  - Input: Tabular features (normalized)
+  - Architecture: 2-layer MLP (32 units → 64 units)
+  - Activation: ReLU
+  - Regularization: BatchNorm + Dropout(0.3)
+- **Embedding Tower**: 
+  - Input: PCA-reduced embeddings (standardized)
+  - Architecture: 2-layer MLP (64 units → 64 units)
+  - Activation: ReLU
+  - Regularization: BatchNorm + Dropout(0.3)
+- **Fusion**: 
+  - Concatenate tower outputs → 128-dimensional representation
+- **Classification Head**: 
+  - 64 units (ReLU + Dropout)
+  - Final sigmoid output (binary classification)
+
+**Preprocessing:**
+- Tabular features: Boolean → 0/1, MinMaxScaler normalization
+- Embedding features: StandardScaler normalization (after PCA)
+
+**Training Configuration:**
+- Optimizer: Adam (learning_rate=0.001, weight_decay=1e-4)
+- Scheduler: ReduceLROnPlateau (reduces LR on plateau)
+- Early stopping: Validation AUC, patience=5 epochs
+- Batch size: 32
+- Max epochs: 100
+- Threshold optimization: Selected threshold that maximizes F1 on validation set (not default 0.5)
+
+**Imbalance Handling:**
+- Uses `RandomOverSampler` (oversampling minority class)
+- Oversampling ratios: [0.6, 0.8, 1.0] (minority:majority)
+- Rationale: Neural networks benefit from larger training sets; oversampling preserves all majority class samples
+
+**Rationale**: Captures complex, non-linear interactions between tabular and embedding features through separate processing pipelines integrated into a shared latent representation.
+
+### Feature Selection
+
+**Method**: XGBoost-based feature selection (model-based approach)
+
+**Process**:
+1. Fit XGBoost classifier on training data
+2. Extract feature importance scores (gain-based)
+3. Calculate mean importance across all features
+4. Retain features with `importance > mean(importance)`
+5. Apply feature mask consistently to train/val/test sets
+
+**Implementation Details**:
+- Performed separately for tabular-only and tabular+embeddings modes
+- Handles missing values before selection (median for numeric, mode for categorical)
+- Safety check: Ensures at least minimum number of features selected
+
+**Typical Results**:
+- **Tabular-only mode**: ~30-50 features selected from ~100-112 total (30-50% retention)
+- **Tabular+embeddings mode**: ~100-150 features selected from ~400-407 total (25-37% retention)
+
+**Rationale**: 
+- Reduces noise and prevents overfitting
+- Improves model interpretability
+- Speeds up training
+- Focuses on features with genuine predictive power
+
+### Class Imbalance Handling
+
+The dataset exhibits class imbalance (completed:non-completed ≈ 3.12:1, or non-completed:completed ≈ 1:3.12). We employ multiple strategies:
+
+#### Downsampling (Random Forest, XGBoost)
+
+**Methods**:
+1. **`class_weight='balanced'`**: Original imbalanced data with adjusted class weights (uses all data)
+2. **Fully downsampled (1:1)**: Random sampling to create balanced dataset without class weights
+3. **Partially downsampled (1:1.5)**: 1.5 majority samples per minority sample, with `class_weight='balanced'`
+4. **Partially downsampled (1:2)**: 2 majority samples per minority sample, with `class_weight='balanced'`
+
+**Implementation**: `RandomUnderSampler` from `imblearn`, applied only to training data (validation/test unchanged)
+
+**Rationale**: Downsampling preserves data integrity by using only real observations, avoiding potentially unrealistic synthetic samples that may not reflect real-world distributions.
+
+#### Oversampling (Neural Network)
+
+**Methods**: `RandomOverSampler` with ratios [0.6, 0.8, 1.0]
+
+**Rationale**: Neural networks benefit from larger training sets; oversampling preserves all majority class samples while increasing minority class representation.
+
+#### Repeated Runs
+
+- **10 independent iterations** per strategy
+- Each iteration uses different random seed for sampling
+- Metrics averaged across iterations
+- Standard deviations computed to assess variability
+
+**Rationale**: Ensures robust evaluation given the stochastic nature of sampling procedures, providing more reliable performance estimates.
+
+---
+
+## Experiments and Results
+
+### Data Splitting Strategy
+
+- **Training Set**: 68% of data (used for model training and hyperparameter tuning)
+- **Validation Set**: 12% of data (used for hyperparameter selection and early stopping)
+- **Test Set**: 20% of data (used only for final evaluation, never used in training or tuning)
+
+**Stratification**: Splits stratified by `label_feasible` to maintain class distribution across all sets.
+
+**Leakage Prevention**:
+- PCA and feature selection fitted only on training data
+- Post-hoc information explicitly excluded from features
+- Validation set used for tuning, test set held out completely
+
+### Evaluation Metrics
+
+We compute five standard classification metrics:
+
+1. **Accuracy**: Overall classification accuracy
+2. **Precision**: True positives / (True positives + False positives)
+3. **Recall**: True positives / (True positives + False negatives)
+4. **F1 Score**: Harmonic mean of precision and recall
+5. **ROC-AUC**: Area under the receiver operating characteristic curve
+
+**Rationale**: 
+- **Accuracy**: Overall performance
+- **Precision**: Important for identifying truly feasible trials (minimize false positives)
+- **Recall**: Important for identifying all feasible trials (minimize false negatives)
+- **F1**: Balances precision and recall
+- **ROC-AUC**: Robust to class imbalance, measures discrimination ability
+
+### Evaluation Protocol
+
+For each model configuration:
+1. **10 iterations**: Each iteration uses different random seeds for:
+   - Downsampling/oversampling
+   - Model initialization (if applicable)
+2. **Metrics computation**: Computed all 5 metrics on test set for each iteration
+3. **Aggregation**: Averaged metrics across 10 iterations, computed standard deviations
+4. **Reporting**: Reported mean ± std for each metric
+
+### Results Format
+
+Results are saved to:
+- **CSV**: `results/model_comparison.csv` with columns:
+  - `model_name`, `input_mode`, `imbalance_strategy`, `metric_name`, `mean`, `std`
+- **Markdown**: `results/model_comparison.md` with summary tables and best models per metric
+
+### Results Highlights
+
+**Best Performing Models**:
+- **Best ROC-AUC**: XGBoost (tabular+embeddings, class_weight) = **0.8263 ± 0.0050**
+- **Best Accuracy**: XGBoost (tabular+embeddings, class_weight) = **0.7788 ± 0.0041**
+- **Best F1**: RandomForest (tabular+embeddings, class_weight) = **0.8315 ± 0.0026**
+- **Best Recall**: RandomForest (tabular+embeddings, class_weight) = **0.9238 ± 0.0050**
+- **Best Precision**: SVM (tabular, class_weight) = **0.7650 ± 0.0000**
+
+**Key Findings:**
+- **Embedding-enhanced models outperform tabular-only models**: XGBoost tabular+embeddings (0.8263) vs. tabular-only (0.8105) = +1.9% improvement
+- **Class weight balancing performs best**: All top models use `class_weight='balanced'` strategy
+- **XGBoost is best overall for ROC-AUC and accuracy**: Highest ROC-AUC (0.8263) and accuracy (0.7788)
+- **RandomForest has best recall and F1**: Identifies 92.4% of completed trials correctly, best F1 score (0.8315)
+- **Neural network competitive**: DualTowerNN achieves 0.7865 ROC-AUC with oversampling
+
+**Tabular vs. Tabular+Embeddings Comparison:**
+- ROC-AUC improvement: +0.52% (0.8220 → 0.8263)
+- Accuracy improvement: +0.44% (0.7754 → 0.7788)
+- Recall improvement: +3.13% (0.8958 → 0.9238)
+
+---
+
+## Technical Implementation
+
+### Technology Stack
+
+**Core Libraries:**
+- **pandas**: Data manipulation and analysis
+- **numpy**: Numerical computations
+- **scikit-learn**: Machine learning utilities (models, preprocessing, evaluation)
+- **xgboost**: Gradient boosting classifier
+- **imbalanced-learn**: Advanced class imbalance handling
+- **torch (PyTorch)**: Deep learning framework for neural networks
+- **transformers**: Hugging Face library for BioLinkBERT embeddings
+- **tqdm**: Progress bars for long-running operations
+
+### Code Organization
+
+```
+Project 2/
+├── scripts/                      # Main code package
+│   ├── config.py                 # Centralized configuration (paths, hyperparameters)
+│   ├── data_loading.py           # Dataset loading, feature splitting, train/val/test split
+│   ├── feature_selection.py      # XGBoost-based feature selection
+│   ├── imbalance.py              # Class imbalance handling utilities
+│   ├── models/                   # Model implementations
+│   │   ├── svm_model.py          # SVM baseline
+│   │   ├── rf_model.py           # Random Forest
+│   │   ├── xgb_model.py          # XGBoost
+│   │   └── dual_tower_nn.py      # Dual-tower neural network
+│   └── pipeline/                 # Pipeline scripts (executed sequentially)
+│       ├── 01_parse_raw_data.py
+│       ├── 02_extract_mesh_features.py
+│       ├── 03_extract_eligibility_complexity.py
+│       ├── 04_generate_embeddings.py
+│       ├── 05_apply_pca.py
+│       ├── 06_combine_features.py
+│       └── 07_train_models.py
+├── run_experiments.py            # Main orchestration script
+├── data/                         # Intermediate processed data
+├── data_enhanced/                # Final processed datasets
+├── results/                      # Experiment results and saved models
+│   ├── model_comparison.csv
+│   ├── model_comparison.md
+│   └── models/                   # Saved models (PCA, scalers)
+    └── methods_overview.md
+```
+
+### Key Design Principles
+
+1. **Modularity**: Each pipeline step is a separate, reusable script
+2. **Reproducibility**: Fixed random seeds, saved models (PCA, scalers)
+3. **Data Leakage Prevention**: Explicit exclusion of post-hoc information, proper train/val/test splits
+4. **Extensibility**: Easy to add new models or features
+5. **Documentation**: Comprehensive docstrings and markdown documentation
+
+### Computational Requirements
+
+**Recommended Hardware:**
+- **CPU**: Multi-core processor (for parallel processing)
+- **RAM**: 16GB+ (for handling large datasets)
+- **GPU**: NVIDIA GPU with CUDA support (optional but recommended for embedding generation, ~10x speedup)
+
+**Estimated Runtime:**
+- Steps 1-3: < 5 minutes
+- Step 4 (Embeddings): ~30-60 minutes (CPU) or ~5-10 minutes (GPU)
+- Step 5 (PCA): ~1-2 minutes
+- Step 6 (Combine): < 1 minute
+- Step 7 (Model Training): ~2-4 hours (depends on hardware and number of models)
+
+---
+
+## Key Contributions
+
+### Methodological Contributions
+
+1. **Multi-modal Feature Integration**: Demonstrated effective combination of structured tabular data with unstructured textual embeddings for clinical trial feasibility prediction
+
+2. **Domain-Specific Embeddings**: Leveraged BioLinkBERT (biomedical language model) to capture semantic information from trial descriptions and eligibility criteria
+
+3. **Comprehensive Feature Engineering**: Extracted domain-specific features (disease flags, intervention types, eligibility complexity) that capture clinical trial characteristics
+
+4. **Rigorous Evaluation**: 10-iteration repeated runs with multiple class imbalance strategies for robust performance assessment
+
+### Technical Contributions
+
+1. **Modular Pipeline Design**: Clean, reusable code structure enabling easy extension and reproduction
+
+2. **Data Leakage Prevention**: Explicit identification and exclusion of post-hoc information, ensuring realistic prediction scenarios
+
+3. **Handling Mixed Data Types**: Robust preprocessing for object dtype columns, missing values, and categorical features across multiple model families
+
+4. **Comprehensive Model Suite**: Implementation of 4 model families (SVM, RF, XGBoost, NN) with proper hyperparameter tuning and evaluation
+
+### Practical Impact
+
+1. **Early Risk Identification**: Enables stakeholders to identify trials at risk of failure early, allowing for proactive intervention
+
+2. **Resource Optimization**: Informs resource allocation decisions by predicting trial feasibility
+
+3. **Protocol Design Insights**: Feature importance analysis can inform protocol design improvements
+
+4. **Reproducible Methodology**: Well-documented, open-source implementation enables replication and extension
+
+---
+
+## Future Directions
+
+1. **External Validation**: Validate on held-out test sets and external datasets
+2. **Temporal Modeling**: Incorporate temporal features (trial start year, enrollment trends)
+3. **Multi-disease Expansion**: Extend to other disease domains beyond oncology
+4. **Interpretability**: Deep dive into which textual patterns predict feasibility (attention mechanisms, SHAP values)
+5. **Real-time Prediction**: Deploy models for prospective trial feasibility assessment
+6. **Ensemble Methods**: Combine predictions from multiple models for improved performance
+7. **Cost-Benefit Analysis**: Incorporate resource cost information to optimize intervention strategies
+
+---
+
+## References and Resources
+
+- **ClinicalTrials.gov**: https://clinicaltrials.gov/
+- **ClinicalTrials.gov v2 API**: https://clinicaltrials.gov/api
+- **BioLinkBERT**: michiyasunaga/BioLinkBERT-base (Hugging Face)
+- **Dataset**: Publicly available CTGov data (no special access required)
+
+---
+
+**Last Updated**: 2025-12-12
+**Dataset Version**: Oncology Phase 2/3/4, Interventional, Industry-Sponsored
+**Pipeline Version**: v2.0 (aligned with thesis methodology)
+
